@@ -1,6 +1,7 @@
 "use client";
 
 import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import { Eye, EyeOff, FileText, Pencil, RotateCcw, Scissors, WandSparkles, X } from "lucide-react";
 import { useEditorStore } from "@/lib/store";
 import { findFillerWordIds } from "@/lib/fillers";
@@ -48,14 +49,14 @@ const WordSpan = memo(function WordSpan({
 }: {
   word: Word;
   active: boolean;
-  onClick: (word: Word) => void;
+  onClick: (word: Word, el: HTMLElement) => void;
 }) {
   // The trailing space lives inside the span so that selection and deletion
   // highlights are continuous across words instead of breaking at each gap.
   return (
     <span
       data-wid={word.id}
-      onClick={() => onClick(word)}
+      onClick={(e) => onClick(word, e.currentTarget)}
       className={`py-0.5 cursor-pointer transition-colors duration-75 ${word.deleted
         ? "word-deleted bg-red-50 text-red-400 line-through decoration-red-300"
         : active
@@ -76,6 +77,18 @@ interface SelectionInfo {
   left: number;
 }
 
+function useTouchDevice() {
+  const [touch, setTouch] = useState(false);
+  useEffect(() => {
+    const mq = window.matchMedia("(pointer: coarse)");
+    const update = () => setTouch(mq.matches);
+    update();
+    mq.addEventListener("change", update);
+    return () => mq.removeEventListener("change", update);
+  }, []);
+  return touch;
+}
+
 export default function TranscriptPanel() {
   const words = useEditorStore((s) => s.words);
   const status = useEditorStore((s) => s.status);
@@ -94,6 +107,16 @@ export default function TranscriptPanel() {
   const containerRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const importInputRef = useRef<HTMLInputElement>(null);
+  const correctInputRef = useRef<HTMLInputElement>(null);
+  // Word spans currently painted with our custom selection highlight.
+  const markedRef = useRef<Set<HTMLElement>>(new Set());
+  // On touch devices we drive selection by tapping words instead of dragging a
+  // text range — long-press selection is fiddly and pops the native copy menu.
+  const isTouch = useTouchDevice();
+  const isTouchRef = useRef(isTouch);
+  useEffect(() => {
+    isTouchRef.current = isTouch;
+  }, [isTouch]);
   const [selection, setSelection] = useState<SelectionInfo | null>(null);
   const [correcting, setCorrecting] = useState<{
     ids: number[];
@@ -154,11 +177,46 @@ export default function TranscriptPanel() {
     setCurrentTime(word.start + 0.001);
   }, []);
 
+  // Touch: select the tapped word and float the toolbar over it. This gives
+  // phones a one-tap path to Cut / Correct without the native selection UI.
+  const selectWordForTouch = useCallback((word: Word, el: HTMLElement) => {
+    const container = containerRef.current;
+    if (!container) return;
+    for (const m of markedRef.current) m.removeAttribute("data-sel");
+    markedRef.current.clear();
+    el.setAttribute("data-sel", "");
+    markedRef.current.add(el);
+    const rect = el.getBoundingClientRect();
+    const containerRect = container.getBoundingClientRect();
+    const above = rect.top - containerRect.top - 44;
+    setSelection({
+      ids: [word.id],
+      anyDeleted: word.deleted,
+      anyKept: !word.deleted,
+      // Drop below the word when there is no room above it (first lines).
+      top: above < 4 ? rect.bottom - containerRect.top + 8 : above,
+      left: Math.max(8, rect.left - containerRect.left + rect.width / 2),
+    });
+  }, []);
+
+  const onWordTap = useCallback(
+    (word: Word, el: HTMLElement) => {
+      seekToWord(word);
+      if (isTouchRef.current) selectWordForTouch(word, el);
+    },
+    [seekToWord, selectWordForTouch]
+  );
+
+  const clearTouchSelection = useCallback(() => {
+    for (const el of markedRef.current) el.removeAttribute("data-sel");
+    markedRef.current.clear();
+    setSelection(null);
+  }, []);
+
   // Track text selection over word spans, position the floating toolbar, and
   // paint our own (dimmed, gap-free) highlight by marking the selected spans.
   // The native ::selection highlight is made transparent over the words, and
   // the marking is done imperatively so dragging doesn't re-render the panel.
-  const markedRef = useRef<Set<HTMLElement>>(new Set());
   useEffect(() => {
     const clearMarks = () => {
       for (const el of markedRef.current) el.removeAttribute("data-sel");
@@ -167,6 +225,8 @@ export default function TranscriptPanel() {
     const handler = () => {
       // Keep the highlight frozen on the words being corrected.
       if (correctingRef.current) return;
+      // Touch devices manage selection by tapping words, not text ranges.
+      if (isTouchRef.current) return;
       const container = containerRef.current;
       const sel = window.getSelection();
       if (!container || !sel || sel.isCollapsed || sel.rangeCount === 0) {
@@ -242,16 +302,23 @@ export default function TranscriptPanel() {
       .filter((w) => idSet.has(w.id))
       .map((w) => w.text)
       .join(" ");
-    correctingRef.current = true;
-    setCorrectText(text);
-    setCorrecting({
+    const info = {
       ids: selection.ids,
       top: selection.top,
       left: selection.left,
       containerWidth: containerRef.current?.clientWidth ?? 640,
+    };
+    // Mount the popover synchronously so the input can be focused inside this
+    // tap gesture — mobile browsers only raise the keyboard for a focus() that
+    // happens within the user gesture, not after an async re-render.
+    flushSync(() => {
+      correctingRef.current = true;
+      setCorrectText(text);
+      setCorrecting(info);
+      setSelection(null);
     });
-    setSelection(null);
     window.getSelection()?.removeAllRanges();
+    correctInputRef.current?.focus();
   }, [selection, words]);
 
   const closeCorrect = useCallback(() => {
@@ -271,11 +338,11 @@ export default function TranscriptPanel() {
   const popoverRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!correcting) return;
-    const handler = (e: MouseEvent) => {
+    const handler = (e: Event) => {
       if (!popoverRef.current?.contains(e.target as Node)) closeCorrect();
     };
-    document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
+    document.addEventListener("pointerdown", handler);
+    return () => document.removeEventListener("pointerdown", handler);
   }, [correcting, closeCorrect]);
 
   // Delete / Backspace cuts the selected words.
@@ -366,7 +433,17 @@ export default function TranscriptPanel() {
       </div>
 
       <div ref={scrollRef} className="relative min-h-0 flex-1 overflow-y-auto">
-        <div ref={containerRef} className="relative mx-auto max-w-2xl px-4 py-6 sm:px-8 sm:py-8">
+        <div
+          ref={containerRef}
+          onClick={(e) => {
+            if (!isTouchRef.current) return;
+            const t = e.target as HTMLElement;
+            // Word taps select; menu taps act. A tap on empty space dismisses.
+            if (t.closest("[data-wid]") || t.closest("[data-edit-menu]")) return;
+            clearTouchSelection();
+          }}
+          className="relative mx-auto max-w-2xl px-4 py-6 sm:px-8 sm:py-8"
+        >
           {busy && (
             <div className="flex flex-col items-start gap-4">
               <div className="w-full bg-zinc-50 p-2">
@@ -416,13 +493,19 @@ export default function TranscriptPanel() {
                     >
                       Speaker {turn.speaker + 1}
                     </div>
-                    <p className="select-text text-[15px] leading-8">
+                    <p
+                      className={`text-[15px] leading-8 ${
+                        isTouch
+                          ? "select-none [-webkit-touch-callout:none]"
+                          : "select-text"
+                      }`}
+                    >
                       {visible.map((w) => (
                         <WordSpan
                           key={w.id}
                           word={w}
                           active={w.id === activeWordId}
-                          onClick={seekToWord}
+                          onClick={onWordTap}
                         />
                       ))}
                     </p>
@@ -434,6 +517,7 @@ export default function TranscriptPanel() {
 
           {selection && !correcting && (
             <div
+              data-edit-menu
               className="absolute z-20 flex -translate-x-1/2 items-center gap-0.5 rounded-xl border border-zinc-200 bg-white p-1 shadow-lg shadow-zinc-900/10"
               style={{ top: selection.top, left: selection.left }}
               onMouseDown={(e) => e.preventDefault()}
@@ -469,6 +553,7 @@ export default function TranscriptPanel() {
           {correcting && (
             <div
               ref={popoverRef}
+              data-edit-menu
               className="absolute z-20 w-80 max-w-[calc(100%-16px)] -translate-x-1/2 rounded-2xl border border-zinc-200 bg-white p-3 shadow-xl shadow-zinc-900/10"
               style={{
                 top: Math.max(4, correcting.top - 56),
@@ -488,6 +573,7 @@ export default function TranscriptPanel() {
                 </button>
               </div>
               <input
+                ref={correctInputRef}
                 autoFocus
                 value={correctText}
                 onChange={(e) => setCorrectText(e.target.value)}
